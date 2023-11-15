@@ -5,14 +5,18 @@ from ibapi.order import Order
 from threading import Thread
 import time
 import datetime
+import sys
+import logging
+logging.basicConfig(level=logging.INFO)
 
 
 class TestApp(EWrapper, EClient):
     def __init__(self):
         EClient.__init__(self, self)
-        self.next_order_id = None
-        self.vix_spot_price = 0
-        self.vix_future_price = 0
+        self.next_order_id = 0
+        self.vix_spot_price = None
+        self.vix_future_price = None
+        self.e_mini_price = None
         self.num_business_days = 9
         self.hedge_ratio = 2.61
         self.position = 0
@@ -22,6 +26,13 @@ class TestApp(EWrapper, EClient):
         self.vix_future_contract = None
         self.e_mini_contract = None
         self.position_days = 0
+        self.b_t = None
+        self.symbolmap = {
+            1001: 'VX',
+            1002: 'VIX',
+            1003: 'EMINI'
+        }
+        self.data_received = False
 
     def nextValidId(self, orderId: int):
         super().nextValidId(orderId)
@@ -58,14 +69,30 @@ class TestApp(EWrapper, EClient):
         return contract
 
     def start(self):
-
+        self.reqMarketDataType(3)
         self.vix_future_contract = self.create_vix_future_contract()
         self.e_mini_contract = self.create_emini_contract()
+        self.vix_spot_contract = self.create_vix_spot_contract()
+
+        self.get_todays_open_price(self.vix_spot_contract, self.VIX_INDEX_REQ_ID)
+        self.get_todays_open_price(self.vix_future_contract, self.VIX_FUTURE_REQ_ID)
+        self.get_todays_open_price(self.e_mini_contract, self.EMINI_REQ_ID)
+
+        timeout = 10  # seconds
+        start_time = time.time()
+
+        if all([self.vix_future_price, self.vix_spot_price, self.e_mini_price]):
+            self.data_received = True
+            logging.info("All necessary historical data received.")
+
+        while not self.data_received and time.time() - start_time < timeout:
+            time.sleep(0.001)
+
 
         if self.check_if_market_is_open():
 
-            self.calculate_basis_and_roll()
             self.run_strategy()
+
         else:
             print('WARNING: MARKET IS CLOSED! \n' * 10)
 
@@ -91,6 +118,8 @@ class TestApp(EWrapper, EClient):
                                keepUpToDate=False,
                                chartOptions=[])
 
+
+
     def get_market_hours(self):
         # hardcoded to be replaced
         return {
@@ -98,35 +127,50 @@ class TestApp(EWrapper, EClient):
             'close': datetime.time(hour=16, minute=0)
         }
 
-    def check_if_market_is_open(self,):
+    def check_if_market_is_open(self, ):
         market_hours = self.get_market_hours()
         current_time = datetime.datetime.now().time()
-
-        if market_hours['open'] <= current_time <= market_hours['close']:
-            return True
-        else:
-            return False
+        return True
+        # if market_hours['open'] <= current_time <= market_hours['close']:
+        #     return True
+        # else:
+        #     return False
 
     def historicalData(self, reqId, bar):
-        print(f"Open price for reqId {reqId}: {bar.open}")
+        logging.info(f"Received historical data for reqId {reqId} ({self.symbolmap[reqId]}): Open price {bar.open}")
+        print(f"Open price for reqId {reqId} {self.symbolmap[reqId]}: {bar.open}")
+
         if reqId == self.VIX_FUTURE_REQ_ID:
             self.vix_future_price = bar.open
+            print('vix fut:', bar.open)
         elif reqId == self.VIX_INDEX_REQ_ID:
             self.vix_spot_price = bar.open
+            print('vix_spot', bar.open)
+        elif reqId == self.EMINI_REQ_ID:
+            self.e_mini_price = bar.open
+            print('emini', bar.open)
+
+
+
 
     def calculate_basis_and_roll(self):
-        self.vix_future_price = self.get_todays_open_price(self.create_vix_future_contract(),
-                                                           reqId=self.VIX_FUTURE_REQ_ID)
-        self.vix_spot_price = self.get_todays_open_price(self.create_vix_spot_contract(),
-                                                         reqId=self.VIX_INDEX_REQ_ID)
         self.b_t = self.vix_future_price / self.vix_spot_price - 1
         self.daily_roll = (self.vix_future_price - self.vix_spot_price) / self.num_business_days
 
     def run_strategy(self):
-        if self.b_t > 0 and self.daily_roll > 0.10:
-            self.short_vix_futures()
-        elif self.b_t < 0 and self.daily_roll < -0.10:
-            self.long_vix_futures()
+        if self.vix_future_price is not None and self.vix_spot_price is not None:
+            self.calculate_basis_and_roll()
+
+            if self.b_t > 0 and self.daily_roll > 0.10:
+                self.short_vix_futures()
+                self.next_order_id += 1
+
+            elif self.b_t < 0 and self.daily_roll < -0.10:
+                self.long_vix_futures()
+                self.next_order_id += 1
+
+        else:
+            print('no prices received')
 
     def short_vix_futures(self):
         if self.position != -1:
@@ -165,7 +209,11 @@ class TestApp(EWrapper, EClient):
         self.next_order_id += 1
 
     def error(self, reqId, errorCode, errorString):
-        print("Error: ", reqId, " ", errorCode, " ", errorString)
+        if reqId == -1:
+            entity = 'GENERAL LOG'
+        else:
+            entity = self.symbolmap.get(reqId)
+        print("Error: ", reqId, " ", errorCode, " ", errorString, 'for', entity)
 
     def contractDetails(self, reqId, contractDetails):
         print("contractDetails: ", reqId, " ", contractDetails)
@@ -180,4 +228,5 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.info("Starting the IBKR Trading Application")
     main()
