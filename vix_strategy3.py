@@ -6,13 +6,17 @@ from threading import Thread
 import time
 import datetime
 import sys
+import numpy as np
 import logging
+from threading import Event
+
 logging.basicConfig(level=logging.INFO)
 
 
 class TestApp(EWrapper, EClient):
     def __init__(self):
         EClient.__init__(self, self)
+        self.daily_roll = None
         self.next_order_id = 0
         self.vix_spot_price = None
         self.vix_future_price = None
@@ -27,12 +31,21 @@ class TestApp(EWrapper, EClient):
         self.e_mini_contract = None
         self.position_days = 0
         self.b_t = None
+        self.vx_outstanding = 0
+        self.emini_outstanding = 0
+
         self.symbolmap = {
             1001: 'VX',
             1002: 'VIX',
             1003: 'EMINI'
         }
-        self.data_received = False
+
+        self.data_received_events = {
+            self.VIX_FUTURE_REQ_ID: Event(),
+            self.VIX_INDEX_REQ_ID: Event(),
+            self.EMINI_REQ_ID: Event()
+        }
+        self.data_flag = 0
 
     def nextValidId(self, orderId: int):
         super().nextValidId(orderId)
@@ -41,12 +54,12 @@ class TestApp(EWrapper, EClient):
 
     def create_vix_future_contract(self):
         contract = Contract()
-        contract.localSymbol = "VXZ3"
+        contract.localSymbol = "VXF4"
         contract.tradingClass = 'VX'
         contract.secType = "FUT"
         contract.exchange = "CFE"
         contract.currency = "USD"
-        contract.lastTradeDateOrContractMonth = "202312"
+        contract.lastTradeDateOrContractMonth = "202401"
         return contract
 
     def create_vix_spot_contract(self):
@@ -69,6 +82,10 @@ class TestApp(EWrapper, EClient):
         return contract
 
     def start(self):
+
+        if not self.check_if_market_is_open():
+            logging.info('WARNING: MARKET IS CLOSED!')
+            self.disconnect()
         self.reqMarketDataType(3)
         self.vix_future_contract = self.create_vix_future_contract()
         self.e_mini_contract = self.create_emini_contract()
@@ -78,23 +95,10 @@ class TestApp(EWrapper, EClient):
         self.get_todays_open_price(self.vix_future_contract, self.VIX_FUTURE_REQ_ID)
         self.get_todays_open_price(self.e_mini_contract, self.EMINI_REQ_ID)
 
-        timeout = 10  # seconds
-        start_time = time.time()
+        all_data_received = all(self.data_received_events.values())
 
-        if all([self.vix_future_price, self.vix_spot_price, self.e_mini_price]):
-            self.data_received = True
-            logging.info("All necessary historical data received.")
-
-        while not self.data_received and time.time() - start_time < timeout:
-            time.sleep(0.001)
-
-
-        if self.check_if_market_is_open():
-
-            self.run_strategy()
-
-        else:
-            print('WARNING: MARKET IS CLOSED! \n' * 10)
+        while not all_data_received:
+            time.sleep(0.01)
 
     def create_contract(self, symbol, sec_type, exchange, currency):
         contract = Contract()
@@ -117,8 +121,6 @@ class TestApp(EWrapper, EClient):
                                formatDate=1,
                                keepUpToDate=False,
                                chartOptions=[])
-
-
 
     def get_market_hours(self):
         # hardcoded to be replaced
@@ -143,21 +145,32 @@ class TestApp(EWrapper, EClient):
         if reqId == self.VIX_FUTURE_REQ_ID:
             self.vix_future_price = bar.open
             print('vix fut:', bar.open)
+
         elif reqId == self.VIX_INDEX_REQ_ID:
             self.vix_spot_price = bar.open
             print('vix_spot', bar.open)
+
         elif reqId == self.EMINI_REQ_ID:
             self.e_mini_price = bar.open
             print('emini', bar.open)
 
+    def historicalDataEnd(self, reqId: int, start: str, end: str):
+        logging.info(f"Historical data download completed for reqId {reqId}")
+        self.data_received_events[reqId].set()
+        time.sleep(1)
 
-
+        if all([event_flag.is_set() for event_flag in self.data_received_events.values()]):
+            time.sleep(1)
+            self.run_strategy()
+        else:
+            logging.info('PRICES NOT RECEIVED')
 
     def calculate_basis_and_roll(self):
         self.b_t = self.vix_future_price / self.vix_spot_price - 1
         self.daily_roll = (self.vix_future_price - self.vix_spot_price) / self.num_business_days
 
     def run_strategy(self):
+
         if self.vix_future_price is not None and self.vix_spot_price is not None:
             self.calculate_basis_and_roll()
 
@@ -170,21 +183,30 @@ class TestApp(EWrapper, EClient):
                 self.next_order_id += 1
 
         else:
-            print('no prices received')
+            logging.info('PRICES NOT RECEIVED- CHECK FAILED')
 
-    def short_vix_futures(self):
+    def short_vix_futures(self, size=25):
         if self.position != -1:
             self.exit_position()
-            self.place_order(self.vix_future_contract, -1)
-            self.place_order(self.e_mini_contract, self.hedge_ratio)
+            self.place_order(self.vix_future_contract, -size)
+            self.place_order(self.e_mini_contract, self.calculate_hedge_quantity(-size))
+            self.emini_outstanding += self.calculate_hedge_quantity(size)
+            self.vx_outstanding -= size
             self.position = -1
 
-    def long_vix_futures(self):
+    def long_vix_futures(self, size=25):
         if self.position != 1:
             self.exit_position()
-            self.place_order(self.vix_future_contract, 1)
-            self.place_order(self.e_mini_contract, -self.hedge_ratio)
+            self.place_order(self.vix_future_contract, size)
+            self.place_order(self.e_mini_contract, self.calculate_hedge_quantity(size))
+            self.emini_outstanding -= self.calculate_hedge_quantity(size)
+            self.vx_outstanding += size
             self.position = 1
+
+    def calculate_hedge_quantity(self, vx_quantity):
+        vx_value = vx_quantity * self.vix_future_price
+        emini_quantity = -(np.floor(vx_value / self.e_mini_price * self.hedge_ratio))
+        return emini_quantity
 
     def exit_position(self):
         if self.position == -1 and self.daily_roll < 0.05:
@@ -204,6 +226,8 @@ class TestApp(EWrapper, EClient):
         order = Order()
         order.action = "BUY" if quantity > 0 else "SELL"
         order.orderType = "MKT"
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
         order.totalQuantity = abs(quantity)
         self.placeOrder(self.next_order_id, contract, order)
         self.next_order_id += 1
